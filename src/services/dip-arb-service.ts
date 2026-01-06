@@ -121,6 +121,12 @@ export class DipArbService extends EventEmitter {
   // Signal state - prevent duplicate signals within same round
   private leg1SignalEmitted = false;
 
+  // Smart logging state - reduce orderbook noise
+  private lastOrderbookLogTime = 0;
+  private readonly ORDERBOOK_LOG_INTERVAL_MS = 10000;  // Log orderbook every 10 seconds
+  private orderbookBuffer: Array<{ timestamp: number; upAsk: number; downAsk: number; upDepth: number; downDepth: number }> = [];
+  private readonly ORDERBOOK_BUFFER_SIZE = 50;  // Keep 5 seconds of data at ~10 updates/sec
+
   constructor(
     realtimeService: RealtimeServiceV2,
     tradingService: TradingService | null,
@@ -346,14 +352,14 @@ export class DipArbService extends EventEmitter {
       [market.upTokenId, market.downTokenId],
       {
         onOrderbook: (book: OrderbookSnapshot) => {
-          if (this.config.debug) {
-            const bookTokenId = book.tokenId || book.assetId;
-            const tokenType = bookTokenId === market.upTokenId ? 'UP' :
-                              bookTokenId === market.downTokenId ? 'DOWN' : 'UNKNOWN';
-            const bestAsk = book.asks[0]?.price ?? 'N/A';
-            this.log(`Orderbook [${tokenType}]: asks=${book.asks.length}, bestAsk=${bestAsk}`);
-          }
+          // Handle the orderbook update (always)
           this.handleOrderbookUpdate(book);
+
+          // Smart logging: only log at intervals, not every update
+          if (this.config.debug) {
+            this.updateOrderbookBuffer(book);
+            this.maybeLogOrderbookSummary();
+          }
         },
         onError: (error: Error) => this.emit('error', error),
       }
@@ -373,8 +379,68 @@ export class DipArbService extends EventEmitter {
       }
     );
 
+    // ✅ FIX: Check and merge existing pairs at startup
+    if (this.ctf && this.config.autoMerge) {
+      await this.scanAndMergeExistingPairs();
+    }
+
     this.emit('started', market);
     this.log('Monitoring for dip arbitrage opportunities...');
+  }
+
+  /**
+   * ✅ FIX: Scan and merge existing UP/DOWN pairs at startup
+   *
+   * When the service starts or rotates to a new market, check if there are
+   * existing UP + DOWN token pairs from previous sessions and merge them.
+   */
+  private async scanAndMergeExistingPairs(): Promise<void> {
+    if (!this.ctf || !this.market) return;
+
+    try {
+      const tokenIds = {
+        yesTokenId: this.market.upTokenId,
+        noTokenId: this.market.downTokenId,
+      };
+
+      const balances = await this.ctf.getPositionBalanceByTokenIds(
+        this.market.conditionId,
+        tokenIds
+      );
+
+      const upBalance = parseFloat(balances.yesBalance);
+      const downBalance = parseFloat(balances.noBalance);
+
+      // Calculate how many pairs can be merged
+      const pairsToMerge = Math.min(upBalance, downBalance);
+
+      if (pairsToMerge > 0.01) {  // Minimum 0.01 to avoid dust
+        this.log(`🔍 Found existing pairs: UP=${upBalance.toFixed(2)}, DOWN=${downBalance.toFixed(2)}`);
+        this.log(`🔄 Auto-merging ${pairsToMerge.toFixed(2)} pairs at startup...`);
+
+        try {
+          const result = await this.ctf.mergeByTokenIds(
+            this.market.conditionId,
+            tokenIds,
+            pairsToMerge.toString()
+          );
+
+          if (result.success) {
+            this.log(`✅ Startup merge successful: ${pairsToMerge.toFixed(2)} pairs → $${result.usdcReceived || pairsToMerge.toFixed(2)} USDC.e`);
+            this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
+          } else {
+            this.log(`❌ Startup merge failed`);
+          }
+        } catch (mergeError) {
+          this.log(`❌ Startup merge error: ${mergeError instanceof Error ? mergeError.message : String(mergeError)}`);
+        }
+      } else if (upBalance > 0 || downBalance > 0) {
+        // Has tokens but not enough pairs to merge
+        this.log(`📊 Existing positions: UP=${upBalance.toFixed(2)}, DOWN=${downBalance.toFixed(2)} (no pairs to merge)`);
+      }
+    } catch (error) {
+      this.log(`Warning: Failed to scan existing pairs: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   /**
@@ -468,6 +534,7 @@ export class DipArbService extends EventEmitter {
     const startTime = Date.now();
 
     if (!this.tradingService || !this.market || !this.currentRound) {
+      this.isExecuting = false;  // Reset in case handleSignal() set it
       return {
         success: false,
         leg: 'leg1',
@@ -478,22 +545,65 @@ export class DipArbService extends EventEmitter {
     }
 
     try {
-      this.isExecuting = true;
+      this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
 
-      const orderParams: MarketOrderParams = {
-        tokenId: signal.tokenId,
-        side: 'BUY' as Side,
-        amount: signal.shares * signal.targetPrice,
-      };
+      // 计算拆分订单参数
+      const splitCount = Math.max(1, this.config.splitOrders);
 
-      const result = await this.tradingService.createMarketOrder(orderParams);
+      // 机制保证：确保满足 $1 最低限额
+      const minSharesForMinAmount = Math.ceil(1 / signal.targetPrice);
+      const adjustedShares = Math.max(signal.shares, minSharesForMinAmount);
 
-      if (result.success) {
+      if (adjustedShares > signal.shares) {
+        this.log(`📊 Shares adjusted: ${signal.shares} → ${adjustedShares} (to meet $1 minimum at price ${signal.targetPrice.toFixed(4)})`);
+      }
+
+      const sharesPerOrder = adjustedShares / splitCount;
+      const amountPerOrder = sharesPerOrder * signal.targetPrice;
+
+      let totalSharesFilled = 0;
+      let totalAmountSpent = 0;
+      let lastOrderId: string | undefined;
+      let failedOrders = 0;
+
+      // 执行多笔订单
+      for (let i = 0; i < splitCount; i++) {
+        const orderParams: MarketOrderParams = {
+          tokenId: signal.tokenId,
+          side: 'BUY' as Side,
+          amount: amountPerOrder,
+        };
+
+        if (this.config.debug && splitCount > 1) {
+          this.log(`Leg1 order ${i + 1}/${splitCount}: ${sharesPerOrder.toFixed(2)} shares @ ${signal.targetPrice.toFixed(4)}`);
+        }
+
+        const result = await this.tradingService.createMarketOrder(orderParams);
+
+        if (result.success) {
+          totalSharesFilled += sharesPerOrder;
+          totalAmountSpent += amountPerOrder;
+          lastOrderId = result.orderId;
+        } else {
+          failedOrders++;
+          this.log(`Leg1 order ${i + 1}/${splitCount} failed: ${result.errorMsg}`);
+        }
+
+        // 订单间隔
+        if (i < splitCount - 1 && this.config.orderIntervalMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, this.config.orderIntervalMs));
+        }
+      }
+
+      // 至少有一笔成功
+      if (totalSharesFilled > 0) {
+        const avgPrice = totalAmountSpent / totalSharesFilled;
+
         // Record leg1 fill
         this.currentRound.leg1 = {
           side: signal.dipSide,
-          price: signal.targetPrice,
-          shares: signal.shares,
+          price: avgPrice,
+          shares: totalSharesFilled,
           timestamp: Date.now(),
           tokenId: signal.tokenId,
         };
@@ -502,22 +612,35 @@ export class DipArbService extends EventEmitter {
 
         this.lastExecutionTime = Date.now();
 
+        // Detailed execution logging
+        const slippage = ((avgPrice - signal.currentPrice) / signal.currentPrice * 100);
+        const execTimeMs = Date.now() - startTime;
+
+        this.log(`✅ Leg1 FILLED: ${signal.dipSide} x${totalSharesFilled.toFixed(1)} @ ${avgPrice.toFixed(4)}`);
+        this.log(`   Expected: ${signal.currentPrice.toFixed(4)} | Actual: ${avgPrice.toFixed(4)} | Slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}%`);
+        this.log(`   Execution time: ${execTimeMs}ms | Orders: ${splitCount - failedOrders}/${splitCount}`);
+
+        // Log orderbook after execution
+        if (this.config.debug) {
+          this.logOrderbookContext('Post-Leg1');
+        }
+
         return {
           success: true,
           leg: 'leg1',
           roundId: signal.roundId,
           side: signal.dipSide,
-          price: signal.targetPrice,
-          shares: signal.shares,
-          orderId: result.orderId,
-          executionTimeMs: Date.now() - startTime,
+          price: avgPrice,
+          shares: totalSharesFilled,
+          orderId: lastOrderId,
+          executionTimeMs: execTimeMs,
         };
       } else {
         return {
           success: false,
           leg: 'leg1',
           roundId: signal.roundId,
-          error: result.errorMsg || 'Order failed',
+          error: 'All orders failed',
           executionTimeMs: Date.now() - startTime,
         };
       }
@@ -541,6 +664,7 @@ export class DipArbService extends EventEmitter {
     const startTime = Date.now();
 
     if (!this.tradingService || !this.market || !this.currentRound) {
+      this.isExecuting = false;  // Reset in case handleSignal() set it
       return {
         success: false,
         leg: 'leg2',
@@ -551,35 +675,97 @@ export class DipArbService extends EventEmitter {
     }
 
     try {
-      this.isExecuting = true;
+      this.isExecuting = true;  // Also set here for manual mode (when not called from handleSignal)
 
-      const orderParams: MarketOrderParams = {
-        tokenId: signal.tokenId,
-        side: 'BUY' as Side,
-        amount: signal.shares * signal.targetPrice,
-      };
+      // 计算拆分订单参数
+      const splitCount = Math.max(1, this.config.splitOrders);
 
-      const result = await this.tradingService.createMarketOrder(orderParams);
+      // 机制保证：确保满足 $1 最低限额
+      const minSharesForMinAmount = Math.ceil(1 / signal.targetPrice);
+      const adjustedShares = Math.max(signal.shares, minSharesForMinAmount);
 
-      if (result.success) {
+      if (adjustedShares > signal.shares) {
+        this.log(`📊 Leg2 Shares adjusted: ${signal.shares} → ${adjustedShares} (to meet $1 minimum at price ${signal.targetPrice.toFixed(4)})`);
+      }
+
+      const sharesPerOrder = adjustedShares / splitCount;
+      const amountPerOrder = sharesPerOrder * signal.targetPrice;
+
+      let totalSharesFilled = 0;
+      let totalAmountSpent = 0;
+      let lastOrderId: string | undefined;
+      let failedOrders = 0;
+
+      // 执行多笔订单
+      for (let i = 0; i < splitCount; i++) {
+        const orderParams: MarketOrderParams = {
+          tokenId: signal.tokenId,
+          side: 'BUY' as Side,
+          amount: amountPerOrder,
+        };
+
+        if (this.config.debug && splitCount > 1) {
+          this.log(`Leg2 order ${i + 1}/${splitCount}: ${sharesPerOrder.toFixed(2)} shares @ ${signal.targetPrice.toFixed(4)}`);
+        }
+
+        const result = await this.tradingService.createMarketOrder(orderParams);
+
+        if (result.success) {
+          totalSharesFilled += sharesPerOrder;
+          totalAmountSpent += amountPerOrder;
+          lastOrderId = result.orderId;
+        } else {
+          failedOrders++;
+          this.log(`Leg2 order ${i + 1}/${splitCount} failed: ${result.errorMsg}`);
+        }
+
+        // 订单间隔
+        if (i < splitCount - 1 && this.config.orderIntervalMs > 0) {
+          await new Promise(resolve => setTimeout(resolve, this.config.orderIntervalMs));
+        }
+      }
+
+      // 至少有一笔成功
+      if (totalSharesFilled > 0) {
+        const avgPrice = totalAmountSpent / totalSharesFilled;
+        const leg1Price = this.currentRound.leg1?.price || 0;
+        const actualTotalCost = leg1Price + avgPrice;
+
         // Record leg2 fill
         this.currentRound.leg2 = {
           side: signal.hedgeSide,
-          price: signal.targetPrice,
-          shares: signal.shares,
+          price: avgPrice,
+          shares: totalSharesFilled,
           timestamp: Date.now(),
           tokenId: signal.tokenId,
         };
         this.currentRound.phase = 'completed';
-        this.currentRound.totalCost = signal.totalCost;
-        this.currentRound.profit = 1 - signal.totalCost;
+        this.currentRound.totalCost = actualTotalCost;
+        this.currentRound.profit = 1 - actualTotalCost;
 
         this.stats.leg2Filled++;
         this.stats.roundsSuccessful++;
-        this.stats.totalProfit += this.currentRound.profit * signal.shares;
-        this.stats.totalSpent += signal.totalCost * signal.shares;
+        this.stats.totalProfit += this.currentRound.profit * totalSharesFilled;
+        this.stats.totalSpent += actualTotalCost * totalSharesFilled;
 
         this.lastExecutionTime = Date.now();
+
+        // Detailed execution logging
+        const slippage = ((avgPrice - signal.currentPrice) / signal.currentPrice * 100);
+        const execTimeMs = Date.now() - startTime;
+        const profitPerShare = this.currentRound.profit;
+        const totalProfit = profitPerShare * totalSharesFilled;
+
+        this.log(`✅ Leg2 FILLED: ${signal.hedgeSide} x${totalSharesFilled.toFixed(1)} @ ${avgPrice.toFixed(4)}`);
+        this.log(`   Expected: ${signal.currentPrice.toFixed(4)} | Actual: ${avgPrice.toFixed(4)} | Slippage: ${slippage >= 0 ? '+' : ''}${slippage.toFixed(2)}%`);
+        this.log(`   Leg1: ${leg1Price.toFixed(4)} + Leg2: ${avgPrice.toFixed(4)} = ${actualTotalCost.toFixed(4)}`);
+        this.log(`   💰 Profit: $${totalProfit.toFixed(2)} (${(profitPerShare * 100).toFixed(2)}% per share)`);
+        this.log(`   Execution time: ${execTimeMs}ms | Orders: ${splitCount - failedOrders}/${splitCount}`);
+
+        // Log orderbook after execution
+        if (this.config.debug) {
+          this.logOrderbookContext('Post-Leg2');
+        }
 
         const roundResult: DipArbRoundResult = {
           roundId: signal.roundId,
@@ -606,9 +792,9 @@ export class DipArbService extends EventEmitter {
           leg: 'leg2',
           roundId: signal.roundId,
           side: signal.hedgeSide,
-          price: signal.targetPrice,
-          shares: signal.shares,
-          orderId: result.orderId,
+          price: avgPrice,
+          shares: totalSharesFilled,
+          orderId: lastOrderId,
           executionTimeMs: Date.now() - startTime,
         };
       } else {
@@ -616,7 +802,7 @@ export class DipArbService extends EventEmitter {
           success: false,
           leg: 'leg2',
           roundId: signal.roundId,
-          error: result.errorMsg || 'Order failed',
+          error: 'All orders failed',
           executionTimeMs: Date.now() - startTime,
         };
       }
@@ -634,7 +820,10 @@ export class DipArbService extends EventEmitter {
   }
 
   /**
-   * Merge YES + NO tokens to USDC
+   * Merge UP + DOWN tokens to USDC.e
+   *
+   * Uses mergeByTokenIds with Polymarket token IDs for correct CLOB market handling.
+   * This locks in profit immediately after Leg2 completes.
    */
   async merge(): Promise<DipArbExecutionResult> {
     const startTime = Date.now();
@@ -650,6 +839,7 @@ export class DipArbService extends EventEmitter {
       };
     }
 
+    // Merge the minimum of Leg1 and Leg2 shares (should be equal after our fix)
     const shares = Math.min(
       this.currentRound.leg1?.shares || 0,
       this.currentRound.leg2?.shares || 0
@@ -666,10 +856,24 @@ export class DipArbService extends EventEmitter {
     }
 
     try {
-      const result = await this.ctf.merge(
+      // Use mergeByTokenIds with Polymarket token IDs
+      const tokenIds = {
+        yesTokenId: this.market.upTokenId,
+        noTokenId: this.market.downTokenId,
+      };
+
+      this.log(`🔄 Merging ${shares.toFixed(1)} UP + DOWN → USDC.e...`);
+
+      const result = await this.ctf.mergeByTokenIds(
         this.market.conditionId,
+        tokenIds,
         shares.toString()
       );
+
+      if (result.success) {
+        this.log(`✅ Merge successful: ${shares.toFixed(1)} pairs → $${result.usdcReceived || shares.toFixed(2)} USDC.e`);
+        this.log(`   TxHash: ${result.txHash?.slice(0, 20)}...`);
+      }
 
       return {
         success: result.success,
@@ -680,11 +884,13 @@ export class DipArbService extends EventEmitter {
         executionTimeMs: Date.now() - startTime,
       };
     } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.log(`❌ Merge failed: ${errorMsg}`);
       return {
         success: false,
         leg: 'merge',
         roundId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMsg,
         executionTimeMs: Date.now() - startTime,
       };
     }
@@ -710,8 +916,15 @@ export class DipArbService extends EventEmitter {
     // Record price history for sliding window detection
     this.recordPriceHistory();
 
-    // Check if we need to start a new round
-    this.checkAndStartNewRound();
+    // Check if we need to start a new round (async but fire-and-forget to not block orderbook updates)
+    this.checkAndStartNewRound().catch(err => {
+      this.emit('error', err instanceof Error ? err : new Error(String(err)));
+    });
+
+    // Skip signal detection entirely if already executing (prevents duplicate detection logs)
+    if (this.isExecuting) {
+      return;
+    }
 
     // Detect signals
     const signal = this.detectSignal();
@@ -792,7 +1005,7 @@ export class DipArbService extends EventEmitter {
 
   // ===== Private: Round Management =====
 
-  private checkAndStartNewRound(): void {
+  private async checkAndStartNewRound(): Promise<void> {
     if (!this.market) return;
 
     // If no current round or current round is completed/expired, start new round
@@ -844,10 +1057,16 @@ export class DipArbService extends EventEmitter {
       this.log(`New round: ${roundId}, Price to Beat: ${priceToBeat.toFixed(2)}`);
     }
 
-    // Check for round expiration
+    // Check for round expiration - exit Leg1 if Leg2 times out
     if (this.currentRound && this.currentRound.phase === 'leg1_filled') {
       const elapsed = (Date.now() - (this.currentRound.leg1?.timestamp || this.currentRound.startTime)) / 1000;
       if (elapsed > this.config.leg2TimeoutSeconds) {
+        // ✅ FIX: Exit Leg1 position to avoid unhedged exposure
+        this.log(`⚠️ Leg2 timeout (${elapsed.toFixed(0)}s > ${this.config.leg2TimeoutSeconds}s), exiting Leg1 position...`);
+
+        // Try to sell Leg1 position
+        const exitResult = await this.emergencyExitLeg1();
+
         this.currentRound.phase = 'expired';
         this.stats.roundsExpired++;
         this.stats.roundsCompleted++;
@@ -857,11 +1076,95 @@ export class DipArbService extends EventEmitter {
           status: 'expired',
           leg1: this.currentRound.leg1,
           merged: false,
+          exitResult,  // Include exit result for tracking
         };
 
         this.emit('roundComplete', result);
-        this.log(`Round expired: ${this.currentRound.roundId}`);
+        this.log(`Round expired: ${this.currentRound.roundId} | Exit: ${exitResult?.success ? 'SUCCESS' : 'FAILED'}`);
       }
+    }
+  }
+
+  /**
+   * Emergency exit Leg1 position when Leg2 times out
+   * Sells the Leg1 tokens at market price to avoid unhedged exposure
+   */
+  private async emergencyExitLeg1(): Promise<DipArbExecutionResult | null> {
+    if (!this.tradingService || !this.market || !this.currentRound?.leg1) {
+      this.log('Cannot exit Leg1: no trading service or position');
+      return null;
+    }
+
+    const leg1 = this.currentRound.leg1;
+    const startTime = Date.now();
+
+    try {
+      this.log(`Selling ${leg1.shares} ${leg1.side} tokens...`);
+
+      // Get current price for the token
+      const currentPrice = leg1.side === 'UP'
+        ? (this.upAsks[0]?.price ?? 0.5)
+        : (this.downAsks[0]?.price ?? 0.5);
+
+      const exitAmount = leg1.shares * currentPrice;
+
+      // 检查退出金额是否满足最低限额
+      if (exitAmount < 1) {
+        this.log(`⚠️ Exit amount ($${exitAmount.toFixed(2)}) below $1 minimum - position will be held to expiry`);
+        return {
+          success: false,
+          leg: 'exit',
+          roundId: this.currentRound.roundId,
+          error: `Exit amount ($${exitAmount.toFixed(2)}) below Polymarket minimum ($1) - holding to expiry`,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+
+      // Market sell the position
+      const result = await this.tradingService.createMarketOrder({
+        tokenId: leg1.tokenId,
+        side: 'SELL' as Side,
+        amount: exitAmount,
+      });
+
+      if (result.success) {
+        const soldPrice = currentPrice;  // Approximate
+        const loss = (leg1.price - soldPrice) * leg1.shares;
+
+        this.log(`✅ Leg1 exit successful: sold ${leg1.shares}x ${leg1.side} @ ~${soldPrice.toFixed(4)} | Loss: $${loss.toFixed(2)}`);
+
+        // Update stats with the loss
+        this.stats.totalProfit -= Math.abs(loss);
+
+        return {
+          success: true,
+          leg: 'exit',
+          roundId: this.currentRound.roundId,
+          side: leg1.side,
+          price: soldPrice,
+          shares: leg1.shares,
+          orderId: result.orderId,
+          executionTimeMs: Date.now() - startTime,
+        };
+      } else {
+        this.log(`❌ Leg1 exit failed: ${result.errorMsg}`);
+        return {
+          success: false,
+          leg: 'exit',
+          roundId: this.currentRound.roundId,
+          error: result.errorMsg,
+          executionTimeMs: Date.now() - startTime,
+        };
+      }
+    } catch (error) {
+      this.log(`❌ Leg1 exit error: ${error instanceof Error ? error.message : String(error)}`);
+      return {
+        success: false,
+        leg: 'exit',
+        roundId: this.currentRound.roundId,
+        error: error instanceof Error ? error.message : String(error),
+        executionTimeMs: Date.now() - startTime,
+      };
     }
   }
 
@@ -1076,6 +1379,8 @@ export class DipArbService extends EventEmitter {
       this.log(`✅ Leg2 signal found! ${hedgeSide} @ ${currentPrice.toFixed(4)}, totalCost ${totalCost.toFixed(4)}, profit ${(expectedProfitRate * 100).toFixed(2)}%`);
     }
 
+    // ✅ FIX: Use leg1.shares instead of config.shares to ensure balanced hedge
+    // This is critical - Leg2 must buy exactly the same shares as Leg1 to create a perfect hedge
     return {
       type: 'leg2',
       roundId: this.currentRound.roundId,
@@ -1085,7 +1390,7 @@ export class DipArbService extends EventEmitter {
       targetPrice,
       totalCost,
       expectedProfitRate,
-      shares: this.config.shares,
+      shares: leg1.shares,  // Must match Leg1 to ensure balanced hedge
       tokenId: hedgeSide === 'UP' ? this.market.upTokenId : this.market.downTokenId,
     };
   }
@@ -1124,32 +1429,72 @@ export class DipArbService extends EventEmitter {
   // ===== Private: Signal Handling =====
 
   private async handleSignal(signal: DipArbSignal): Promise<void> {
+    // Check if we can execute before emitting signal
+    // This prevents logging signals that won't be executed
+    if (!this.config.autoExecute) {
+      // Manual mode: always emit signal for user to decide
+      this.stats.signalsDetected++;
+      this.emit('signal', signal);
+
+      if (this.config.debug) {
+        if (isDipArbLeg1Signal(signal)) {
+          this.log(`Signal: Leg1 ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)} (${signal.source})`);
+        } else {
+          this.log(`Signal: Leg2 ${signal.hedgeSide} @ ${signal.currentPrice.toFixed(4)}`);
+        }
+      }
+      return;
+    }
+
+    // Auto-execute mode: only emit and log if we will actually execute
+    // Note: isExecuting is already checked in processOrderbook(), this is a safety guard
+    if (this.isExecuting) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - this.lastExecutionTime < this.config.executionCooldown) {
+      // Skip - within cooldown period
+      if (this.config.debug) {
+        const remaining = this.config.executionCooldown - (now - this.lastExecutionTime);
+        this.log(`Signal skipped (cooldown ${remaining}ms): ${isDipArbLeg1Signal(signal) ? 'Leg1' : 'Leg2'}`);
+      }
+      return;
+    }
+
+    // CRITICAL: Set isExecuting immediately to prevent duplicate signals from being processed
+    // This must happen before any async operations or emit() calls
+    this.isExecuting = true;
+
+    // Will execute - now emit signal and log
     this.stats.signalsDetected++;
     this.emit('signal', signal);
 
     if (this.config.debug) {
+      const signalType = isDipArbLeg1Signal(signal) ? 'Leg1' : 'Leg2';
+
+      // Log orderbook context before execution (last 5 seconds of data)
+      this.logOrderbookContext(`${signalType} Signal`);
+
       if (isDipArbLeg1Signal(signal)) {
-        this.log(`Signal: Leg1 ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)} (${signal.source})`);
+        this.log(`🎯 Signal: Leg1 ${signal.dipSide} @ ${signal.currentPrice.toFixed(4)} (${signal.source})`);
+        this.log(`   Target: ${signal.targetPrice.toFixed(4)} | Opposite: ${signal.oppositeAsk.toFixed(4)} | Est.Cost: ${signal.estimatedTotalCost.toFixed(4)}`);
       } else {
-        this.log(`Signal: Leg2 ${signal.hedgeSide} @ ${signal.currentPrice.toFixed(4)}`);
+        this.log(`🎯 Signal: Leg2 ${signal.hedgeSide} @ ${signal.currentPrice.toFixed(4)}`);
+        this.log(`   Target: ${signal.targetPrice.toFixed(4)} | TotalCost: ${signal.totalCost.toFixed(4)} | Profit: ${(signal.expectedProfitRate * 100).toFixed(2)}%`);
       }
     }
 
-    // Auto-execute if enabled
-    if (this.config.autoExecute && !this.isExecuting) {
-      const now = Date.now();
-      if (now - this.lastExecutionTime >= this.config.executionCooldown) {
-        let result: DipArbExecutionResult;
+    // Execute
+    let result: DipArbExecutionResult;
 
-        if (isDipArbLeg1Signal(signal)) {
-          result = await this.executeLeg1(signal);
-        } else {
-          result = await this.executeLeg2(signal);
-        }
-
-        this.emit('execution', result);
-      }
+    if (isDipArbLeg1Signal(signal)) {
+      result = await this.executeLeg1(signal);
+    } else {
+      result = await this.executeLeg2(signal);
     }
+
+    this.emit('execution', result);
   }
 
   // ===== Public API: Auto-Rotate =====
@@ -1186,6 +1531,122 @@ export class DipArbService extends EventEmitter {
     // Start background redemption check if using redeem strategy
     if (this.autoRotateConfig.settleStrategy === 'redeem') {
       this.startRedeemCheck();
+
+      // ✅ FIX: Scan for existing redeemable positions at startup
+      this.scanAndQueueRedeemablePositions().catch(err => {
+        this.log(`Warning: Failed to scan redeemable positions: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+  }
+
+  /**
+   * ✅ FIX: Scan for existing redeemable positions and add them to the queue
+   *
+   * This is called when auto-rotate is enabled to recover any positions
+   * from previous sessions that can be redeemed.
+   */
+  private async scanAndQueueRedeemablePositions(): Promise<void> {
+    if (!this.ctf) {
+      this.log('Cannot scan redeemable positions: CTF client not available');
+      return;
+    }
+
+    try {
+      // Scan for recently ended markets of the configured underlyings
+      const now = Date.now();
+      const markets = await this.scanUpcomingMarkets({
+        coin: this.autoRotateConfig.underlyings.length === 1
+          ? this.autoRotateConfig.underlyings[0]
+          : 'all',
+        duration: this.autoRotateConfig.duration,
+        minMinutesUntilEnd: -60,  // Include markets that ended up to 60 minutes ago
+        maxMinutesUntilEnd: 0,    // Only ended markets
+        limit: 20,
+      });
+
+      this.log(`🔍 Scanning ${markets.length} recently ended markets for redeemable positions...`);
+
+      let foundCount = 0;
+      for (const market of markets) {
+        // Skip current market
+        if (market.conditionId === this.market?.conditionId) continue;
+
+        // Check if we have any position in this market
+        try {
+          const tokenIds = {
+            yesTokenId: market.upTokenId,
+            noTokenId: market.downTokenId,
+          };
+
+          const balances = await this.ctf.getPositionBalanceByTokenIds(
+            market.conditionId,
+            tokenIds
+          );
+
+          const upBalance = parseFloat(balances.yesBalance);
+          const downBalance = parseFloat(balances.noBalance);
+
+          // If we have any tokens, check if market is resolved
+          if (upBalance > 0.01 || downBalance > 0.01) {
+            const resolution = await this.ctf.getMarketResolution(market.conditionId);
+
+            if (resolution.isResolved) {
+              // Check if we have winning tokens
+              const winningBalance = resolution.winningOutcome === 'YES' ? upBalance : downBalance;
+
+              if (winningBalance > 0.01) {
+                // Add to pending redemption queue
+                const pending: DipArbPendingRedemption = {
+                  market,
+                  round: {
+                    roundId: `recovery-${market.slug}`,
+                    priceToBeat: 0,
+                    openPrices: { up: 0, down: 0 },
+                    startTime: 0,
+                    endTime: market.endTime.getTime(),
+                    phase: 'completed',
+                  },
+                  marketEndTime: market.endTime.getTime(),
+                  addedAt: now,
+                  retryCount: 0,
+                };
+
+                this.pendingRedemptions.push(pending);
+                foundCount++;
+                this.log(`📌 Found redeemable: ${market.slug} | ${resolution.winningOutcome} won | Balance: ${winningBalance.toFixed(2)}`);
+              }
+            } else if (upBalance > 0.01 && downBalance > 0.01) {
+              // Market not resolved but we have pairs - can merge
+              const pairsToMerge = Math.min(upBalance, downBalance);
+              this.log(`📌 Found mergeable pairs in ${market.slug}: ${pairsToMerge.toFixed(2)}`);
+
+              // Try to merge immediately
+              try {
+                const result = await this.ctf.mergeByTokenIds(
+                  market.conditionId,
+                  tokenIds,
+                  pairsToMerge.toString()
+                );
+                if (result.success) {
+                  this.log(`✅ Merged ${pairsToMerge.toFixed(2)} pairs from ${market.slug}`);
+                }
+              } catch (mergeErr) {
+                this.log(`⚠️ Failed to merge ${market.slug}: ${mergeErr instanceof Error ? mergeErr.message : String(mergeErr)}`);
+              }
+            }
+          }
+        } catch (err) {
+          // Skip this market on error
+        }
+      }
+
+      if (foundCount > 0) {
+        this.log(`✅ Found ${foundCount} redeemable positions, added to queue`);
+      } else {
+        this.log('No redeemable positions found');
+      }
+    } catch (error) {
+      this.log(`Error scanning redeemable positions: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1690,6 +2151,79 @@ export class DipArbService extends EventEmitter {
   }
 
   // ===== Private: Helpers =====
+
+  /**
+   * Update orderbook buffer for smart logging
+   * Keeps last 5 seconds of orderbook data
+   */
+  private updateOrderbookBuffer(_book: OrderbookSnapshot): void {
+    if (!this.market) return;
+
+    const upAsk = this.upAsks[0]?.price ?? 0;
+    const downAsk = this.downAsks[0]?.price ?? 0;
+
+    this.orderbookBuffer.push({
+      timestamp: Date.now(),
+      upAsk,
+      downAsk,
+      upDepth: this.upAsks.length,
+      downDepth: this.downAsks.length,
+    });
+
+    // Keep only last ORDERBOOK_BUFFER_SIZE entries
+    if (this.orderbookBuffer.length > this.ORDERBOOK_BUFFER_SIZE) {
+      this.orderbookBuffer = this.orderbookBuffer.slice(-this.ORDERBOOK_BUFFER_SIZE);
+    }
+  }
+
+  /**
+   * Log orderbook summary at intervals (every 10 seconds)
+   * Reduces log noise from ~10 logs/sec to 1 log/10sec
+   */
+  private maybeLogOrderbookSummary(): void {
+    const now = Date.now();
+
+    // Only log every ORDERBOOK_LOG_INTERVAL_MS
+    if (now - this.lastOrderbookLogTime < this.ORDERBOOK_LOG_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastOrderbookLogTime = now;
+
+    const upAsk = this.upAsks[0]?.price ?? 0;
+    const downAsk = this.downAsks[0]?.price ?? 0;
+    const sum = upAsk + downAsk;
+
+    this.log(`📊 Orderbook: UP=${upAsk.toFixed(3)} | DOWN=${downAsk.toFixed(3)} | Sum=${sum.toFixed(3)}`);
+  }
+
+  /**
+   * Log orderbook buffer around a signal/trade
+   * Called when signal is detected to capture market context
+   */
+  private logOrderbookContext(eventType: string): void {
+    if (this.orderbookBuffer.length === 0) return;
+
+    this.log(`📈 ${eventType} - Orderbook context (last ${this.orderbookBuffer.length} ticks):`);
+
+    // Log first, middle, and last entries for context
+    const first = this.orderbookBuffer[0];
+    const mid = this.orderbookBuffer[Math.floor(this.orderbookBuffer.length / 2)];
+    const last = this.orderbookBuffer[this.orderbookBuffer.length - 1];
+
+    const formatTime = (ts: number) => new Date(ts).toISOString().slice(11, 23);
+
+    this.log(`   ${formatTime(first.timestamp)}: UP=${first.upAsk.toFixed(4)} DOWN=${first.downAsk.toFixed(4)}`);
+    if (this.orderbookBuffer.length > 2) {
+      this.log(`   ${formatTime(mid.timestamp)}: UP=${mid.upAsk.toFixed(4)} DOWN=${mid.downAsk.toFixed(4)}`);
+    }
+    this.log(`   ${formatTime(last.timestamp)}: UP=${last.upAsk.toFixed(4)} DOWN=${last.downAsk.toFixed(4)}`);
+
+    // Calculate price changes
+    const upChange = ((last.upAsk - first.upAsk) / first.upAsk * 100).toFixed(2);
+    const downChange = ((last.downAsk - first.downAsk) / first.downAsk * 100).toFixed(2);
+    this.log(`   Change: UP ${upChange}% | DOWN ${downChange}%`);
+  }
 
   private log(message: string): void {
     const shouldLog = this.config.debug || message.startsWith('Starting') || message.startsWith('Stopped');

@@ -120,6 +120,21 @@ export interface DipArbServiceConfig {
   executionCooldown?: number;
 
   /**
+   * 拆分订单数量
+   * 将 shares 拆分成多笔订单执行
+   * 例如: shares=30, splitOrders=3 → 每笔 10 shares
+   * @default 1 (不拆分)
+   */
+  splitOrders?: number;
+
+  /**
+   * 拆分订单间隔（毫秒）
+   * 多笔订单之间的间隔时间
+   * @default 500
+   */
+  orderIntervalMs?: number;
+
+  /**
    * 启用调试日志
    * @default false
    */
@@ -149,18 +164,20 @@ export type DipArbConfigInternal = Required<Omit<DipArbServiceConfig, 'logHandle
  */
 export const DEFAULT_DIP_ARB_CONFIG: DipArbConfigInternal = {
   shares: 20,
-  sumTarget: 0.95,
+  sumTarget: 0.92,        // ✅ 放宽到 0.92 提高 Leg2 成交率 (8%+ 利润)
   dipThreshold: 0.15,
   windowMinutes: 2,
   slidingWindowMs: 3000,  // 3秒滑动窗口 - 核心参数！
   maxSlippage: 0.02,
   minProfitRate: 0.03,
-  leg2TimeoutSeconds: 300,
+  leg2TimeoutSeconds: 180,  // ✅ 缩短到 3 分钟，更快退出未对冲仓位
   enableSurge: true,
   surgeThreshold: 0.15,
   autoMerge: true,
   autoExecute: false,
   executionCooldown: 3000,
+  splitOrders: 1,         // ✅ 默认不拆分，避免份额误差
+  orderIntervalMs: 500,   // 拆分订单间隔 500ms
   debug: false,
 };
 
@@ -324,7 +341,7 @@ export interface DipArbExecutionResult {
   /** 是否成功 */
   success: boolean;
   /** 执行的 leg */
-  leg: 'leg1' | 'leg2' | 'merge';
+  leg: 'leg1' | 'leg2' | 'merge' | 'exit';
   /** 轮次 ID */
   roundId: string;
   /** 交易侧 */
@@ -365,6 +382,8 @@ export interface DipArbRoundResult {
   merged: boolean;
   /** 合并交易哈希 */
   mergeTxHash?: string;
+  /** Leg1 退出结果（Leg2 超时时） */
+  exitResult?: DipArbExecutionResult | null;
 }
 
 // ============= Statistics =============

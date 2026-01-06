@@ -145,6 +145,24 @@ export interface GammaMarket {
   endDate: Date;
 
   /**
+   * When the market was created
+   * @remarks For crypto 15m markets, this is ~24h before trading starts
+   */
+  createdAt?: Date;
+
+  /**
+   * When the market became ready (NOT trading start time!)
+   * @remarks For crypto 15m markets, this is close to createdAt.
+   * The actual trading start time should be parsed from the slug.
+   */
+  startDate?: Date;
+
+  /**
+   * When the market started accepting orders
+   */
+  acceptingOrdersTimestamp?: Date;
+
+  /**
    * Whether the market is currently active
    */
   active: boolean;
@@ -566,6 +584,11 @@ export class GammaApiClient {
       bestBid: m.bestBid !== undefined ? Number(m.bestBid) : undefined,
       bestAsk: m.bestAsk !== undefined ? Number(m.bestAsk) : undefined,
       endDate: new Date(String(m.endDate || Date.now())),
+      createdAt: m.createdAt ? new Date(String(m.createdAt)) : undefined,
+      startDate: m.startDate ? new Date(String(m.startDate)) : undefined,
+      acceptingOrdersTimestamp: m.acceptingOrdersTimestamp
+        ? new Date(String(m.acceptingOrdersTimestamp))
+        : undefined,
       active: Boolean(m.active),
       closed: Boolean(m.closed),
       image: m.image ? String(m.image) : undefined,

@@ -196,13 +196,24 @@ export class MarketService {
   /**
    * Get market from CLOB by condition ID
    */
-  async getClobMarket(conditionId: string): Promise<Market> {
+  async getClobMarket(conditionId: string): Promise<Market | null> {
     const cacheKey = `clob:market:${conditionId}`;
     return this.cache.getOrSet(cacheKey, CACHE_TTL.MARKET_INFO, async () => {
       const client = await this.ensureInitialized();
       return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
-        const market = await client.getMarket(conditionId);
-        return this.normalizeClobMarket(market as ClobMarket);
+        try {
+          const market = await client.getMarket(conditionId);
+          if (!market || !market.tokens) {
+            return null;
+          }
+          return this.normalizeClobMarket(market as ClobMarket);
+        } catch (error) {
+          // Handle 404 "market not found" gracefully
+          if (error && typeof error === 'object' && 'status' in error && (error as { status: number }).status === 404) {
+            return null;
+          }
+          throw error;
+        }
       });
     });
   }
@@ -305,6 +316,9 @@ export class MarketService {
    */
   async getProcessedOrderbook(conditionId: string): Promise<ProcessedOrderbook> {
     const market = await this.getClobMarket(conditionId);
+    if (!market) {
+      throw new PolymarketError(ErrorCode.MARKET_NOT_FOUND, `Market not found: ${conditionId}`);
+    }
     // Use index-based access instead of name-based (supports Yes/No, Up/Down, Team1/Team2, etc.)
     const yesToken = market.tokens[0];  // primary outcome
     const noToken = market.tokens[1];   // secondary outcome
@@ -415,7 +429,10 @@ export class MarketService {
 
     try {
       const clobMarket = await this.getClobMarket(gammaMarket.conditionId);
-      return this.mergeMarkets(gammaMarket, clobMarket);
+      if (clobMarket) {
+        return this.mergeMarkets(gammaMarket, clobMarket);
+      }
+      return this.fromGammaMarket(gammaMarket);
     } catch {
       return this.fromGammaMarket(gammaMarket);
     }

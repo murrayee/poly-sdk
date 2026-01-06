@@ -1051,7 +1051,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       price: Number(payload.price) || 0,
       side: payload.side as 'BUY' | 'SELL',
       size: Number(payload.size) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
       transactionHash: payload.transactionHash as string || '',
       trader: {
         name: payload.name as string | undefined,
@@ -1065,7 +1065,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     const price: CryptoPrice = {
       symbol: payload.symbol as string || '',
       price: Number(payload.value) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('cryptoPrice', price);
   }
@@ -1074,7 +1074,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     const price: CryptoPrice = {
       symbol: payload.symbol as string || '',
       price: Number(payload.value) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('cryptoChainlinkPrice', price);
   }
@@ -1083,7 +1083,7 @@ export class RealtimeServiceV2 extends EventEmitter {
     const price: EquityPrice = {
       symbol: payload.symbol as string || '',
       price: Number(payload.value) || 0,
-      timestamp: Number(payload.timestamp) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
     this.emit('equityPrice', price);
   }
@@ -1159,7 +1159,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       market: payload.market as string || '',
       bids,
       asks,
-      timestamp: parseInt(payload.timestamp as string, 10) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
       tickSize: payload.tick_size as string || '0.01',
       minOrderSize: payload.min_order_size as string || '1',
       hash: payload.hash as string || '',
@@ -1181,7 +1181,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       price: parseFloat(payload.price as string) || 0,
       side: payload.side as 'BUY' | 'SELL' || 'BUY',
       size: parseFloat(payload.size as string) || 0,
-      timestamp: parseInt(payload.timestamp as string, 10) || timestamp,
+      timestamp: this.normalizeTimestamp(payload.timestamp) || timestamp,
     };
   }
 
@@ -1242,5 +1242,23 @@ export class RealtimeServiceV2 extends EventEmitter {
     if (this.config.debug) {
       console.log(`[RealtimeService] ${message}`);
     }
+  }
+
+  /**
+   * Normalize timestamp to milliseconds
+   * Polymarket WebSocket returns timestamps in seconds, need to convert to milliseconds
+   */
+  private normalizeTimestamp(ts: unknown): number {
+    if (typeof ts === 'string') {
+      const parsed = parseInt(ts, 10);
+      if (isNaN(parsed)) return Date.now();
+      // If timestamp is in seconds (< 1e12), convert to milliseconds
+      return parsed < 1e12 ? parsed * 1000 : parsed;
+    }
+    if (typeof ts === 'number') {
+      // If timestamp is in seconds (< 1e12), convert to milliseconds
+      return ts < 1e12 ? ts * 1000 : ts;
+    }
+    return Date.now();
   }
 }

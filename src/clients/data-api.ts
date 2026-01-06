@@ -1024,16 +1024,41 @@ export class DataApiClient {
 
   private normalizeHolders(data: unknown[]): MarketHolder[] {
     if (!Array.isArray(data)) return [];
-    return data.map((item) => {
-      const h = item as Record<string, unknown>;
-      return {
-        proxyWallet: String(h.proxyWallet || h.address || ''),
-        size: Number(h.size) || 0,
-        outcome: String(h.outcome || ''),
-        value: h.value !== undefined ? Number(h.value) : undefined,
-        userName: h.userName !== undefined ? String(h.userName) : undefined,
-        profileImage: h.profileImage !== undefined ? String(h.profileImage) : undefined,
-      };
-    });
+
+    // The API returns grouped by token: [{ token, holders: [...] }, { token, holders: [...] }]
+    // We need to flatten this and normalize each holder
+    const result: MarketHolder[] = [];
+
+    for (const item of data) {
+      const tokenGroup = item as Record<string, unknown>;
+
+      // Check if this is the grouped format (has 'holders' array)
+      if (Array.isArray(tokenGroup.holders)) {
+        for (const holder of tokenGroup.holders as Record<string, unknown>[]) {
+          result.push({
+            proxyWallet: String(holder.proxyWallet || holder.address || ''),
+            size: Number(holder.amount || holder.size) || 0,
+            // Map outcomeIndex to outcome name (0 = Yes/Up, 1 = No/Down)
+            outcome: holder.outcomeIndex === 0 ? 'Yes' : holder.outcomeIndex === 1 ? 'No' : String(holder.outcome || ''),
+            value: holder.value !== undefined ? Number(holder.value) : undefined,
+            userName: holder.name !== undefined ? String(holder.name) : (holder.userName !== undefined ? String(holder.userName) : undefined),
+            profileImage: holder.profileImage !== undefined ? String(holder.profileImage) : undefined,
+          });
+        }
+      } else {
+        // Fallback: flat format (for backwards compatibility)
+        const h = tokenGroup;
+        result.push({
+          proxyWallet: String(h.proxyWallet || h.address || ''),
+          size: Number(h.amount || h.size) || 0,
+          outcome: h.outcomeIndex === 0 ? 'Yes' : h.outcomeIndex === 1 ? 'No' : String(h.outcome || ''),
+          value: h.value !== undefined ? Number(h.value) : undefined,
+          userName: h.name !== undefined ? String(h.name) : (h.userName !== undefined ? String(h.userName) : undefined),
+          profileImage: h.profileImage !== undefined ? String(h.profileImage) : undefined,
+        });
+      }
+    }
+
+    return result;
   }
 }
