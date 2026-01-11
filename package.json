@@ -7,6 +7,7 @@
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
+  "packageManager": "pnpm@10.25.0",
   "exports": {
     ".": {
       "types": "./dist/src/index.d.ts",
