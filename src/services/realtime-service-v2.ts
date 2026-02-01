@@ -97,25 +97,33 @@ export interface MarketEvent {
 }
 
 // User data types (requires authentication)
+/**
+ * User order from USER_ORDER WebSocket event
+ * Field names match Polymarket API: https://docs.polymarket.com/developers/CLOB/websocket/user-channel
+ */
 export interface UserOrder {
-  orderId: string;
-  market: string;
-  asset: string;
-  side: 'BUY' | 'SELL';
-  price: number;
-  originalSize: number;
-  matchedSize: number;
-  eventType: 'PLACEMENT' | 'UPDATE' | 'CANCELLATION';
-  timestamp: number;
+  orderId: string;        // API: id
+  market: string;         // API: market
+  asset: string;          // API: asset_id
+  side: 'BUY' | 'SELL';   // API: side
+  price: number;          // API: price
+  originalSize: number;   // API: original_size
+  sizeMatched: number;    // API: size_matched (was incorrectly named matchedSize)
+  eventType: 'PLACEMENT' | 'UPDATE' | 'CANCELLATION';  // API: event_type
+  timestamp: number;      // API: timestamp
 }
 
 /**
- * Maker order info from trade message
+ * Maker order info from USER_TRADE WebSocket event
+ * Field names match Polymarket API: https://docs.polymarket.com/developers/CLOB/websocket/user-channel
  */
 export interface MakerOrderInfo {
-  orderId: string;
-  matchedSize: number;
-  price: number;
+  orderId: string;        // API: order_id
+  matchedAmount: number;  // API: matched_amount
+  price: number;          // API: price
+  assetId?: string;       // API: asset_id
+  outcome?: string;       // API: outcome
+  owner?: string;         // API: owner (maker's address)
 }
 
 export interface UserTrade {
@@ -1407,7 +1415,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         side: payload.side as 'BUY' | 'SELL',
         price: Number(payload.price) || 0,
         originalSize: Number(payload.original_size) || 0,
-        matchedSize: Number(payload.matched_size) || 0,
+        sizeMatched: Number(payload.size_matched) || 0,  // API field: size_matched
         eventType: payload.event_type as 'PLACEMENT' | 'UPDATE' | 'CANCELLATION',
         timestamp,
       };
@@ -1419,8 +1427,11 @@ export class RealtimeServiceV2 extends EventEmitter {
       if (Array.isArray(payload.maker_orders)) {
         makerOrders = (payload.maker_orders as Array<Record<string, unknown>>).map(m => ({
           orderId: m.order_id as string || '',
-          matchedSize: Number(m.matched_size) || 0,
+          matchedAmount: Number(m.matched_amount) || 0,
           price: Number(m.price) || 0,
+          assetId: m.asset_id as string | undefined,
+          outcome: m.outcome as string | undefined,
+          owner: m.owner as string | undefined,
         }));
       }
 
