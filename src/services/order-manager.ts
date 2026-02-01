@@ -1245,8 +1245,8 @@ export class OrderManager extends EventEmitter {
     // Update order state
     watched.order.price = userOrder.price;
     watched.order.originalSize = userOrder.originalSize;
-    watched.order.filledSize = userOrder.matchedSize;
-    watched.order.remainingSize = userOrder.originalSize - userOrder.matchedSize;
+    watched.order.filledSize = userOrder.sizeMatched;
+    watched.order.remainingSize = userOrder.originalSize - userOrder.sizeMatched;
 
     // Infer new status
     let newStatus = watched.lastStatus;
@@ -1254,9 +1254,9 @@ export class OrderManager extends EventEmitter {
     if (userOrder.eventType === 'PLACEMENT') {
       newStatus = OrderStatus.OPEN;
     } else if (userOrder.eventType === 'UPDATE') {
-      if (userOrder.matchedSize > 0) {
+      if (userOrder.sizeMatched > 0) {
         newStatus =
-          userOrder.matchedSize >= userOrder.originalSize
+          userOrder.sizeMatched >= userOrder.originalSize
             ? OrderStatus.FILLED
             : OrderStatus.PARTIALLY_FILLED;
       }
@@ -1317,13 +1317,31 @@ export class OrderManager extends EventEmitter {
 
     console.log(`[OrderManager] USER_TRADE matched watched order: ${watched.orderId}`);
 
-    // Bug 16 Fix: When we're the maker, use maker-specific matchedSize and price
+    // Bug 16 Fix: When we're the maker, use maker-specific matchedAmount and price
     // userTrade.size is the TOTAL trade size (sum of all makers), not our individual fill
-    // Bug 20 Fix: If matchedSize is 0 (undefined in payload), fall back to trade size
-    // This happens when we're the only maker in the trade
-    let fillSize = makerInfo?.matchedSize ?? userTrade.size;
-    if (makerInfo && fillSize === 0 && userTrade.makerOrders?.length === 1) {
-      // We're the only maker, use total trade size
+    // Bug 20 Fix: Previously used wrong field name (matched_size instead of matched_amount)
+    // Now correctly reading matched_amount from Polymarket API
+    const rawMatchedAmount = makerInfo?.matchedAmount;
+    let fillSize = rawMatchedAmount ?? userTrade.size;
+
+    // Debug: Log raw values for verification
+    if (makerInfo) {
+      console.log(`[OrderManager] Maker fill debug:`, {
+        rawMatchedAmount,
+        makerOrdersLength: userTrade.makerOrders?.length,
+        willApplyFallback: fillSize === 0 || fillSize === undefined,
+        makerOrdersDetail: userTrade.makerOrders?.map(m => ({
+          orderId: m.orderId?.slice(0, 12),
+          matchedAmount: m.matchedAmount,
+          price: m.price,
+        })),
+      });
+    }
+
+    // Fallback: if matchedAmount is 0/undefined and we're a maker, use trade size
+    // This shouldn't happen now that we're reading the correct field, but kept as safety
+    if (makerInfo && (fillSize === 0 || fillSize === undefined)) {
+      console.log(`[OrderManager] Fallback applied: using userTrade.size ${userTrade.size} instead of ${fillSize}`);
       fillSize = userTrade.size;
     }
     const fillPrice = makerInfo?.price ?? userTrade.price;
