@@ -299,6 +299,7 @@ export class RealtimeServiceV2 extends EventEmitter {
   private connected = false;
   private userConnected = false;
   private cryptoConnected = false;
+  private connectResolve?: () => void;
 
   // Subscription refresh timer: re-sends subscriptions shortly after they're added
   // This fixes a bug where initial subscriptions on a fresh connection only receive
@@ -346,11 +347,16 @@ export class RealtimeServiceV2 extends EventEmitter {
   /**
    * Connect to WebSocket server
    */
-  connect(): this {
+  async connect(): Promise<void> {
     if (this.client) {
       this.log('Already connected or connecting');
-      return this;
+      return;
     }
+
+    // Promise to track when main client connects
+    const connectPromise = new Promise<void>((resolve) => {
+      this.connectResolve = resolve;
+    });
 
     // Main client for MARKET/USER channels
     this.client = new RealTimeDataClient({
@@ -393,7 +399,10 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.client.connect();
     this.userClient.connect();
     this.cryptoClient.connect();
-    return this;
+
+    // Wait for main client to connect
+    await connectPromise;
+    this.log('Main WebSocket connected, ready to subscribe');
   }
 
   /**
@@ -1160,6 +1169,12 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.connected = true;
     this.connectionGeneration++;
     this.log(`Connected to WebSocket server (generation ${this.connectionGeneration})`);
+
+    // Resolve the connect() promise if waiting
+    if (this.connectResolve) {
+      this.connectResolve();
+      this.connectResolve = undefined;
+    }
 
     // Re-subscribe to all active subscriptions on reconnect
     // Delay subscriptions by 1 second to let the connection stabilize.
