@@ -40,7 +40,7 @@ function logOrder(order: UserOrder) {
   console.log(`│ Side:      ${order.side.padEnd(51)} │`);
   console.log(`│ Price:     ${order.price.toString().padEnd(51)} │`);
   console.log(`│ Size:      ${order.originalSize.toString().padEnd(51)} │`);
-  console.log(`│ Matched:   ${order.matchedSize.toString().padEnd(51)} │`);
+  console.log(`│ Matched:   ${order.sizeMatched.toString().padEnd(51)} │`);
   console.log(`└─────────────────────────────────────────────────────────────────┘`);
 
   events.push({ type: 'order', timestamp: order.timestamp, data: order });
